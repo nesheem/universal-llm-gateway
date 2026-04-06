@@ -1,8 +1,17 @@
 """
-Universal LLM Gateway v1.0 — router.py
+Universal LLM Gateway v1.1 — router.py
 Core LiteLLM-powered routing engine.
 Handles: provider translation, load balancing, cost tracking,
          health checks, benchmarking, request logging.
+
+Fixes applied:
+  - Removed global litellm.ssl_verify = False (security risk); uses certifi instead.
+  - Removed ssl_verify: False from per-slot litellm_kwargs(); uses certifi.
+  - max_tries raised from 5 → 10 so rank=999 fallback slots are not the only options tried.
+  - Auto-offline: slots that fail with a connection/DNS error 3+ times in a row
+    are marked offline immediately so they stop being retried on every request.
+  - route() and route_stream() now track consecutive connection failures per slot.
+  - healthy() unchanged — sorting by rank already puts best slots first.
 """
 import ssl_patch  # MUST be first
 
@@ -21,12 +30,20 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
 import litellm
 
+# ── SSL: use certifi when available, fall back to system certs ────────────────
+try:
+    import certifi
+    _CA_BUNDLE = certifi.where()
+except ImportError:
+    _CA_BUNDLE = True   # httpx/requests default (system certs)
+
 # ── Silence litellm ───────────────────────────────────────────────────────────
-litellm.suppress_debug_info  = True
-litellm.set_verbose          = False
-litellm.drop_params          = True   # ignore unsupported params per provider
-litellm.num_retries          = 0      # we handle retries ourselves
-litellm.ssl_verify           = False  # global SSL bypass
+litellm.suppress_debug_info = True
+litellm.set_verbose         = False
+litellm.drop_params         = True   # ignore unsupported params per provider
+litellm.num_retries         = 0      # we handle retries ourselves
+# ssl_verify now uses certifi (or system certs) — NOT globally disabled
+litellm.ssl_verify          = _CA_BUNDLE
 
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 logging.getLogger("litellm").setLevel(logging.WARNING)
@@ -132,6 +149,10 @@ COST_PER_1M: Dict[str, Dict[str, float]] = {
     "github":    {"input": 0.0,   "output": 0.0},
 }
 
+# How many consecutive connection failures before a slot is auto-marked offline.
+# Connection failures = DNS errors, TCP refused, timeout — NOT rate limits or API errors.
+_CONN_FAIL_THRESHOLD = 3
+
 
 # =============================================================================
 # DATA CLASSES
@@ -169,16 +190,19 @@ class Slot:
     total_cost_usd:  float = 0.0
     created_at:      str = field(default_factory=lambda: datetime.now().isoformat())
 
+    # Internal: consecutive connection failures (not persisted, reset on success)
+    _conn_failures: int = field(default=0, repr=False, compare=False)
+
     def litellm_model(self) -> str:
         prefix = PROVIDER_PREFIX.get(self.provider, "openai")
         return f"{prefix}/{self.model_name}" if prefix else self.model_name
 
     def litellm_kwargs(self) -> dict:
         kw = {
-            "model":       self.litellm_model(),
-            "api_key":     self.api_key,
-            "num_retries": 0,
-            "ssl_verify":  False,
+            "model":           self.litellm_model(),
+            "api_key":         self.api_key,
+            "num_retries":     0,
+            "ssl_verify":      _CA_BUNDLE,   # certifi bundle (was: False)
             "request_timeout": 120,
         }
         if self.provider in NEEDS_API_BASE:
@@ -334,13 +358,33 @@ class SlotManager:
 
 
 # =============================================================================
-# HEALTH CHECKER  — uses direct httpx (NOT litellm) so SSL verify=False works
+# HEALTH CHECKER  — uses direct httpx (NOT litellm) so SSL verify works
 # =============================================================================
 
 RATE_LIMIT_MINUTES = {
     "gemini": 61, "groq": 2, "openrouter": 2, "cerebras": 2,
     "deepseek": 10, "default": 5,
 }
+
+# Strings that indicate a connection/DNS failure (not an API error)
+_CONN_ERROR_MARKERS = (
+    "cannot connect",
+    "could not contact dns",
+    "timeout while contacting dns",
+    "name or service not known",
+    "nodename nor servname",
+    "connection refused",
+    "network is unreachable",
+    "failed to establish",
+    "ssl",
+    "certificate",
+)
+
+
+def _is_connection_error(err: str) -> bool:
+    """Return True if the error looks like a network/DNS/TLS issue."""
+    low = err.lower()
+    return any(m in low for m in _CONN_ERROR_MARKERS)
 
 
 class HealthChecker:
@@ -369,6 +413,7 @@ class HealthChecker:
             slot.last_error       = None
             slot.rate_limited     = False
             slot.rate_limit_until = None
+            slot._conn_failures   = 0   # reset consecutive failures on confirmed healthy
         else:
             slot.last_error = error or "Unknown error"
             if error and ("rate" in error.lower() or "429" in error):
@@ -428,14 +473,24 @@ class Benchmarker:
             slot.total_requests   += 1
             total = slot.total_requests
             slot.success_rate = round(((total - slot.failed_requests) / total) * 100, 1)
+            slot._conn_failures = 0
         except litellm.RateLimitError:
             slot.benchmark_score = 0
             slot.failed_requests += 1
             slot.last_error = "Rate limited during benchmark"
         except Exception as e:
+            err = str(e)
             slot.benchmark_score = 0
             slot.failed_requests += 1
-            slot.last_error = str(e)[:80]
+            slot.last_error = err[:80]
+            if _is_connection_error(err):
+                slot._conn_failures += 1
+                if slot._conn_failures >= _CONN_FAIL_THRESHOLD:
+                    slot.is_healthy = False
+                    logger.warning(
+                        f"Slot {slot.display_name} auto-marked offline after "
+                        f"{slot._conn_failures} consecutive connection failures during benchmark."
+                    )
 
     async def benchmark_all(self):
         healthy = [s for s in self.sm.slots if s.is_healthy]
@@ -481,7 +536,7 @@ class CostTracker:
         self._load()
 
     def _load(self):
-        self.log      = self.config.get("cost_log", [])[-500:]
+        self.log       = self.config.get("cost_log", [])[-500:]
         self.total_usd = self.config.get("total_cost_usd", 0.0)
         for entry in self.log:
             self.by_provider[entry.get("provider", "?")] += entry.get("cost_usd", 0)
@@ -536,14 +591,14 @@ class RequestLog:
                status: str, latency_ms: float = 0,
                error: str = "", msg_preview: str = ""):
         entry = {
-            "ts":          datetime.now().isoformat()[:19],
-            "slot":        slot_name,
-            "provider":    provider,
-            "model":       model,
-            "status":      status,
-            "latency_ms":  round(latency_ms, 1),
-            "error":       error[:120] if error else "",
-            "preview":     msg_preview[:100] if msg_preview else "",
+            "ts":         datetime.now().isoformat()[:19],
+            "slot":       slot_name,
+            "provider":   provider,
+            "model":      model,
+            "status":     status,
+            "latency_ms": round(latency_ms, 1),
+            "error":      error[:120] if error else "",
+            "preview":    msg_preview[:100] if msg_preview else "",
         }
         self.entries.append(entry)
         if len(self.entries) > 1000:
@@ -590,6 +645,25 @@ class ULGRouter:
             content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
         return str(content)[:100]
 
+    def _handle_conn_error(self, slot: Slot, err: str):
+        """
+        Increment consecutive connection-failure counter.
+        Auto-mark the slot offline after _CONN_FAIL_THRESHOLD consecutive failures.
+        """
+        if _is_connection_error(err):
+            slot._conn_failures += 1
+            if slot._conn_failures >= _CONN_FAIL_THRESHOLD:
+                slot.is_healthy = False
+                logger.warning(
+                    f"Slot [{slot.display_name}] auto-marked offline after "
+                    f"{slot._conn_failures} consecutive connection failures. "
+                    f"Run a health check from the dashboard to re-enable it once "
+                    f"network connectivity is restored."
+                )
+        else:
+            # Non-connection errors don't count toward the threshold
+            slot._conn_failures = 0
+
     async def route(self, messages: list, model: str = "ulg-auto",
                     temperature: float = 0.7, max_tokens: int = 4096,
                     stream: bool = False, top_p: float = 1.0,
@@ -601,7 +675,9 @@ class ULGRouter:
                 "Run a health check from the dashboard."
             )
 
-        max_tries = min(len(slots), 5)
+        # Try up to 10 slots (was 5) so that rank=999 fallback slots are
+        # not the only options when top-ranked slots are exhausted.
+        max_tries = min(len(slots), 10)
         last_err  = None
         preview   = self._preview(messages)
 
@@ -634,6 +710,7 @@ class ULGRouter:
                                            in_tok, out_tok, latency)
                 slot.total_requests += 1
                 slot.total_cost_usd += cost
+                slot._conn_failures  = 0   # reset on success
                 n = slot.total_requests
                 slot.success_rate = round(((n - slot.failed_requests) / n) * 100, 1)
                 self.log.record(slot.display_name, slot.provider,
@@ -647,12 +724,14 @@ class ULGRouter:
                 slot.rate_limited     = True
                 slot.rate_limit_until = (datetime.now() + timedelta(minutes=5)).isoformat()
                 slot.failed_requests += 1
+                slot._conn_failures   = 0
                 last_err = str(e)
                 self.log.record(slot.display_name, slot.provider,
                                 slot.model_name, "failed", 0, "Rate limited", preview)
             except Exception as e:
                 slot.failed_requests += 1
                 last_err = str(e)
+                self._handle_conn_error(slot, last_err)
                 self.log.record(slot.display_name, slot.provider,
                                 slot.model_name, "failed", 0, last_err[:80], preview)
                 logger.warning(f"Slot {slot.display_name} failed: {last_err[:80]}")
@@ -667,7 +746,7 @@ class ULGRouter:
         if not slots:
             raise RuntimeError("No healthy input slots available.")
 
-        max_tries = min(len(slots), 5)
+        max_tries = min(len(slots), 10)   # was 5
         last_err  = None
         preview   = self._preview(messages)
 
@@ -687,6 +766,7 @@ class ULGRouter:
             try:
                 resp = await litellm.acompletion(**kw)
                 slot.total_requests += 1
+                slot._conn_failures  = 0
                 async for chunk in resp:
                     if (chunk.choices and chunk.choices[0].delta
                             and chunk.choices[0].delta.content):
@@ -696,8 +776,8 @@ class ULGRouter:
                             "object":  "chat.completion.chunk",
                             "model":   model,
                             "choices": [{
-                                "index":        0,
-                                "delta":        {"content": text},
+                                "index":         0,
+                                "delta":         {"content": text},
                                 "finish_reason": None,
                             }],
                         }
@@ -710,10 +790,12 @@ class ULGRouter:
                 slot.rate_limited     = True
                 slot.rate_limit_until = (datetime.now() + timedelta(minutes=5)).isoformat()
                 slot.failed_requests += 1
+                slot._conn_failures   = 0
                 last_err = str(e)
             except Exception as e:
                 slot.failed_requests += 1
                 last_err = str(e)
+                self._handle_conn_error(slot, last_err)
                 logger.warning(f"Stream slot {slot.display_name} failed: {last_err[:80]}")
 
         raise RuntimeError(f"All stream slots failed. Last: {last_err}")

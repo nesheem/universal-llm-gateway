@@ -1,5 +1,5 @@
 """
-Universal LLM Gateway v1.0 — dashboard.py
+Universal LLM Gateway v1.1 — dashboard.py
 Web dashboard + REST API. All HTML inlined.
 """
 import ssl_patch  # must be first
@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import uvicorn
+import httpx
 from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
@@ -24,7 +25,7 @@ HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Universal LLM Gateway v1.0</title>
+<title>Universal LLM Gateway v1.1</title>
 <style>
 :root{--bg:#0a0a0f;--bg2:#111118;--card:#16161f;--border:#1f2030;
 --text:#e2e8f0;--muted:#5a6480;--dim:#252535;
@@ -32,6 +33,8 @@ HTML = r"""<!DOCTYPE html>
 --font:'Inter',system-ui,sans-serif;--mono:'Cascadia Code','Fira Code','Courier New',monospace}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;min-height:100vh}
+/* Matrix Rain Canvas */
+#matrix-canvas{position:fixed;top:0;left:0;width:100%;height:100%;z-index:0;pointer-events:none;opacity:0.13}
 .layout{display:flex;min-height:100vh}
 .sidebar{width:210px;background:var(--bg2);border-right:1px solid var(--border);
 display:flex;flex-direction:column;flex-shrink:0}
@@ -155,17 +158,17 @@ animation:slide-up .22s ease}
 </style>
 </head>
 <body>
+<canvas id="matrix-canvas"></canvas>
 <div class="layout">
 <aside class="sidebar">
   <div class="logo">
     <div class="logo-name">⚡ UNIVERSAL LLM GATEWAY</div>
-    <div class="logo-sub">v1.0 · Universal API Router</div>
+    <div class="logo-sub">v1.1 · Universal API Router</div>
   </div>
   <nav>
     <div class="nav-item on"  onclick="go('overview',this)"><span class="nav-icon">🏠</span>Overview</div>
     <div class="nav-item"     onclick="go('outkey',this)"><span class="nav-icon">🔑</span>Output Key</div>
     <div class="nav-item"     onclick="go('slots',this)"><span class="nav-icon">📦</span>Input Slots</div>
-    <div class="nav-item"     onclick="go('costs',this)"><span class="nav-icon">💰</span>Cost Tracking</div>
     <div class="nav-item"     onclick="go('logs',this)"><span class="nav-icon">📋</span>Request Logs</div>
     <div class="nav-item"     onclick="go('terminal',this)"><span class="nav-icon">🖥️</span>Terminal</div>
     <div class="nav-item"     onclick="go('addslot',this)"><span class="nav-icon">➕</span>Add Slot</div>
@@ -174,7 +177,6 @@ animation:slide-up .22s ease}
     <div id="sf-status">● ONLINE</div>
     <div id="sf-time"></div>
     <div id="sf-slots"></div>
-    <div id="sf-cost"></div>
   </div>
   <div class="wm"><span>nesheem</span></div>
 </aside>
@@ -184,7 +186,7 @@ animation:slide-up .22s ease}
 <!-- OVERVIEW -->
 <div id="page-overview" class="page on">
   <div class="ph">
-    <div><div class="ph-title">Universal LLM Gateway <span>v1.0</span></div>
+    <div><div class="ph-title">Universal LLM Gateway <span>v1.1</span></div>
     <div style="font-size:.75rem;color:var(--muted);margin-top:3px">Universal LLM Gateway · 100 input slots · 1 output key</div></div>
     <div class="hacts">
       <button class="btn" onclick="doHealth()">⚡ Health Check</button>
@@ -269,6 +271,27 @@ animation:slide-up .22s ease}
     </div>
     <div style="font-size:.7rem;color:var(--muted);margin-top:8px">⚠ Regenerating invalidates the key in all apps immediately.</div>
   </div>
+  <div class="card" style="margin-top:14px">
+    <div class="card-title">🧪 Test Output Key</div>
+    <div style="font-size:.8rem;color:var(--muted);margin-bottom:12px">Send a live test request through the gateway using your current output key to verify it is working.</div>
+    <div class="fr">
+      <input class="fi" id="test-prompt" placeholder="Say hello in one word" value="Say hello in one word" style="flex:1">
+      <select class="fi" id="test-model" style="flex:0 0 200px">
+        <option value="ulg-auto">ulg-auto (best available)</option>
+        <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+        <option value="gpt-4o-mini">gpt-4o-mini</option>
+        <option value="gpt-4o">gpt-4o</option>
+      </select>
+      <button class="btn prim" onclick="testKey()" id="test-btn">▶ Run Test</button>
+    </div>
+    <div id="test-result" style="display:none;margin-top:12px">
+      <div style="font-size:.68rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:6px">Result</div>
+      <div id="test-output" style="background:#06080f;border:1px solid var(--border);border-radius:8px;
+        padding:12px 14px;font-family:var(--mono);font-size:.78rem;color:var(--green);
+        line-height:1.7;white-space:pre-wrap;word-break:break-word;min-height:48px"></div>
+      <div id="test-meta" style="font-size:.68rem;color:var(--muted);margin-top:6px"></div>
+    </div>
+  </div>
 </div>
 
 <!-- SLOTS -->
@@ -296,30 +319,6 @@ animation:slide-up .22s ease}
   </div>
 </div>
 
-<!-- COSTS -->
-<div id="page-costs" class="page">
-  <div class="ph"><div class="ph-title">💰 Cost <span>Tracking</span></div></div>
-  <div class="g3 sp">
-    <div class="sc"><div class="sv green" id="c-total">$0</div><div class="sl">Total Spend</div></div>
-    <div class="sc"><div class="sv cyan" id="c-top-prov">—</div><div class="sl">Top Provider</div></div>
-    <div class="sc"><div class="sv yellow" id="c-avg">$0</div><div class="sl">Avg per Request</div></div>
-  </div>
-  <div class="card sp">
-    <div class="card-title">By Provider</div>
-    <div class="tw"><table>
-      <thead><tr><th>Provider</th><th>Cost (USD)</th><th>Share</th></tr></thead>
-      <tbody id="cost-body"></tbody>
-    </table></div>
-  </div>
-  <div class="card">
-    <div class="card-title">Recent Transactions</div>
-    <div class="tw"><table>
-      <thead><tr><th>Time</th><th>Provider</th><th>Model</th><th>In Tokens</th><th>Out Tokens</th><th>Cost</th><th>Latency</th></tr></thead>
-      <tbody id="cost-log"></tbody>
-    </table></div>
-  </div>
-</div>
-
 <!-- LOGS -->
 <div id="page-logs" class="page">
   <div class="ph">
@@ -340,7 +339,7 @@ animation:slide-up .22s ease}
   <div class="card">
     <div class="card-title">Command Interface</div>
     <div class="term" id="term">
-      <div class="td">Universal LLM Gateway v1.0 terminal. Commands:</div>
+      <div class="td">Universal LLM Gateway v1.1 terminal. Commands:</div>
       <div class="tc">  health       — health check all slots</div>
       <div class="tc">  benchmark    — benchmark healthy slots</div>
       <div class="tc">  status       — show summary</div>
@@ -413,7 +412,6 @@ function go(id,el){
   if(id==='slots')loadSlots();
   if(id==='logs')loadLogs();
   if(id==='outkey')loadKey();
-  if(id==='costs')loadCosts();
 }
 
 function toast(m,t='ok'){
@@ -431,14 +429,14 @@ async function api(path,opts={}){
 
 async function refresh(){
   try{
-    const[s,st,cost]=await Promise.all([api('/status'),api('/stats'),api('/costs')]);
+    const[s,st]=await Promise.all([api('/status'),api('/stats')]);
     document.getElementById('s-h').textContent=s.healthy;
     document.getElementById('s-r').textContent=s.limited;
     document.getElementById('s-o').textContent=s.offline;
     document.getElementById('s-req').textContent=st.total_requests;
     document.getElementById('s-fail').textContent=st.total_failures;
     document.getElementById('s-sr').textContent=st.success_rate+'%';
-    document.getElementById('s-cost').textContent='$'+cost.total_usd.toFixed(4);
+    document.getElementById('s-cost').textContent='$'+(st.total_cost_usd||0).toFixed(4);
     const pct=s.total>0?Math.round(s.healthy/s.total*100):0;
     document.getElementById('hbar').style.width=pct+'%';
     document.getElementById('hpct').textContent=pct+'% healthy ('+s.healthy+'/'+s.total+' slots)';
@@ -448,7 +446,6 @@ async function refresh(){
       '<span class="red">❌ '+s.offline+' offline</span>';
     if(st.last_benchmark)document.getElementById('bench-time').textContent='Last benchmark: '+st.last_benchmark.substring(0,19);
     document.getElementById('sf-slots').textContent=s.healthy+'/'+s.total+' healthy';
-    document.getElementById('sf-cost').textContent='cost: $'+cost.total_usd.toFixed(4);
     // provider grid
     const pg=document.getElementById('prov-grid');
     pg.innerHTML=Object.entries(s.by_provider||{}).map(([p,v])=>`
@@ -585,34 +582,36 @@ async function addSlot(){
   }catch(e){toast('Error: '+e.message,'err')}
 }
 
-async function loadCosts(){
+async function testKey(){
+  const promptEl=document.getElementById('test-prompt');
+  const prompt=promptEl.value.trim()||promptEl.placeholder;
+  const model=document.getElementById('test-model').value;
+  const btn=document.getElementById('test-btn');
+  const resDiv=document.getElementById('test-result');
+  const outDiv=document.getElementById('test-output');
+  const metaDiv=document.getElementById('test-meta');
+  btn.disabled=true; btn.textContent='⏳ Testing…';
+  resDiv.style.display='block';
+  outDiv.style.color='var(--muted)';
+  outDiv.textContent='⏳ Sending request through gateway…';
+  metaDiv.textContent='';
   try{
-    const[c,st]=await Promise.all([api('/costs'),api('/stats')]);
-    document.getElementById('c-total').textContent='$'+c.total_usd.toFixed(6);
-    const entries=Object.entries(c.by_provider||{});
-    const top=entries.length?entries[0][0]:'—';
-    document.getElementById('c-top-prov').textContent=top;
-    const avg=st.total_requests>0?c.total_usd/st.total_requests:0;
-    document.getElementById('c-avg').textContent='$'+avg.toFixed(8);
-    const total=c.total_usd||0.000001;
-    document.getElementById('cost-body').innerHTML=entries.map(([p,v])=>`<tr>
-      <td><span class="chip">${p}</span></td>
-      <td>$${v.toFixed(6)}</td>
-      <td><div style="display:flex;align-items:center;gap:8px">
-        <div style="width:80px;height:4px;background:var(--dim);border-radius:2px;overflow:hidden">
-          <div style="width:${Math.round(v/total*100)}%;height:100%;background:var(--green)"></div></div>
-        ${Math.round(v/total*100)}%</div></td>
-    </tr>`).join('')||'<tr><td colspan="3" style="text-align:center;color:var(--muted);padding:16px">No cost data yet</td></tr>';
-    document.getElementById('cost-log').innerHTML=(c.recent||[]).slice(-20).reverse().map(e=>`<tr>
-      <td style="font-size:.72rem;color:var(--muted)">${e.ts.substring(11)}</td>
-      <td><span class="chip">${e.provider}</span></td>
-      <td style="font-size:.72rem">${e.model}</td>
-      <td style="font-size:.72rem">${e.input_tokens}</td>
-      <td style="font-size:.72rem">${e.output_tokens}</td>
-      <td style="font-size:.72rem;color:var(--green)">$${e.cost_usd.toFixed(8)}</td>
-      <td style="font-size:.72rem">${e.latency_ms.toFixed(0)}ms</td>
-    </tr>`).join('')||'<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:16px">No transactions yet</td></tr>';
-  }catch(e){console.error(e)}
+    const d=await api('/test-key',{
+      method:'POST',
+      body:JSON.stringify({prompt,model})
+    });
+    outDiv.style.color='var(--green)';
+    outDiv.textContent=d.response||'(empty response)';
+    metaDiv.textContent=`✅ Key working · ${d.latency_ms}ms · model: ${d.model_used} · tokens in/out: ${d.tokens_in}/${d.tokens_out}`;
+    toast('✅ Output key is working!');
+  }catch(e){
+    outDiv.style.color='var(--red)';
+    outDiv.textContent='❌ '+e.message;
+    metaDiv.textContent='Test failed — check gateway is running and key is active';
+    toast('Test failed: '+e.message.substring(0,60),'err');
+  }finally{
+    btn.disabled=false; btn.textContent='▶ Run Test';
+  }
 }
 
 async function loadLogs(){
@@ -719,6 +718,42 @@ async function saveEdit(){
     loadSlots();
   }catch(e){toast('Error: '+e.message,'err')}
 }
+
+// ── Matrix Rain ────────────────────────────────────────────────────────────
+(function(){
+  const canvas=document.getElementById('matrix-canvas');
+  const ctx=canvas.getContext('2d');
+  const chars='アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789ABCDEF';
+  let cols,drops,W,H;
+  function resize(){
+    W=canvas.width=window.innerWidth;
+    H=canvas.height=window.innerHeight;
+    cols=Math.floor(W/16);
+    drops=drops&&drops.length===cols?drops:Array.from({length:cols},()=>Math.random()*-H/16|0);
+  }
+  resize();
+  window.addEventListener('resize',resize);
+  function draw(){
+    ctx.fillStyle='rgba(10,10,15,0.18)';
+    ctx.fillRect(0,0,W,H);
+    for(let i=0;i<cols;i++){
+      const ch=chars[Math.random()*chars.length|0];
+      const x=i*16;
+      const y=drops[i]*16;
+      // Lead char brighter
+      ctx.fillStyle='#7fff7f';
+      ctx.font='bold 13px monospace';
+      ctx.fillText(ch,x,y);
+      // Trail
+      ctx.fillStyle='#22c55e';
+      ctx.font='13px monospace';
+      ctx.fillText(chars[Math.random()*chars.length|0],x,y-16);
+      if(y>H&&Math.random()>0.975)drops[i]=0;
+      else drops[i]++;
+    }
+  }
+  setInterval(draw,45);
+})();
 </script>
 </body>
 </html>"""
@@ -741,7 +776,7 @@ class DashboardServer:
         self.ct   = cost_tracker
         self.rl   = request_log
 
-        self.app = FastAPI(title="Universal LLM Gateway v1.0 Dashboard",
+        self.app = FastAPI(title="Universal LLM Gateway v1.1 Dashboard",
                            docs_url=None, redoc_url=None)
         self._routes()
 
@@ -873,6 +908,55 @@ class DashboardServer:
         @app.get("/api/costs")
         async def costs():
             return self.ct.summary()
+
+        # ── Test Key (server-side proxy to avoid browser CORS) ─────────────────
+        @app.post("/api/test-key")
+        async def test_key(request: Request):
+            b        = await request.json()
+            prompt   = b.get("prompt", "Say hello in one word").strip() or "Say hello in one word"
+            model    = b.get("model", "ulg-auto")
+            key      = self.okm.entry.get("key", "")
+            port     = self.cfg.get("proxy_port", 8900)
+            url      = f"http://127.0.0.1:{port}/v1/chat/completions"
+            payload  = {
+                "model":    model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 256,
+            }
+            import time
+            t0 = time.monotonic()
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        url,
+                        json=payload,
+                        headers={"Authorization": f"Bearer {key}",
+                                 "Content-Type": "application/json"},
+                    )
+                latency_ms = round((time.monotonic() - t0) * 1000)
+                if resp.status_code != 200:
+                    raise HTTPException(502,
+                        f"Gateway returned {resp.status_code}: {resp.text[:200]}")
+                data   = resp.json()
+                text   = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                usage  = data.get("usage", {})
+                return {
+                    "ok":         True,
+                    "response":   text,
+                    "model_used": data.get("model", model),
+                    "latency_ms": latency_ms,
+                    "tokens_in":  usage.get("prompt_tokens", 0),
+                    "tokens_out": usage.get("completion_tokens", 0),
+                }
+            except httpx.TimeoutException:
+                raise HTTPException(504, "Gateway timed out after 30s")
+            except httpx.ConnectError:
+                raise HTTPException(503, "Cannot connect to gateway on port "
+                                    f"{port} — is it running?")
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(500, str(e))
 
     async def start(self):
         port = self.cfg.get("dash_port", 8901)

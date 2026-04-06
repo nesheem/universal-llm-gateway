@@ -1,5 +1,5 @@
 """
-Universal LLM Gateway v1.0 — health_check.py
+Universal LLM Gateway v1.1 — health_check.py
 Direct httpx-based health checker — bypasses litellm and all its
 internal SDK SSL handling. Uses verify=False directly on httpx.
 """
@@ -113,7 +113,7 @@ async def check_slot_direct(slot) -> tuple[bool, Optional[str]]:
         }
         if provider == "openrouter":
             headers["HTTP-Referer"] = "https://ulg-engine.local"
-            headers["X-Title"]      = "Universal LLM Gateway v1.0"
+            headers["X-Title"]      = "Universal LLM Gateway v1.1"
 
         async with httpx.AsyncClient(verify=False, timeout=_TIMEOUT) as c:
             r = await c.post(url, json=body, headers=headers)

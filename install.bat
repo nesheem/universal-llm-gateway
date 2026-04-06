@@ -1,7 +1,7 @@
 @echo off
-title Universal LLM Gateway v1.0 - Setup
+title Universal LLM Gateway v1.1 - Setup
 color 0B
-echo Installing Universal LLM Gateway v1.0...
+echo Installing Universal LLM Gateway v1.1...
 python -m pip install --upgrade pip --quiet
 pip install -r requirements.txt
 if not exist logs mkdir logs

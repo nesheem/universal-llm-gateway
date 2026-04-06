@@ -1,4 +1,4 @@
-# ⚡ Universal LLM Gateway v1.0
+# ⚡ Universal LLM Gateway v1.1
 
 > **By [nesheem](https://github.com/nesheem)**
 
@@ -13,7 +13,7 @@ Your App  (OpenAI-compatible client)
       │
       │  ← one Output Key
       ▼
- Universal LLM Gateway v1.0   (port 8900)
+ Universal LLM Gateway v1.1   (port 8900)
       │
       │  ← picks the best healthy slot by rank
       ▼
@@ -135,7 +135,7 @@ universal-llm-gateway/
 
 ## Changelog
 
-### v1.0
+### v1.1
 - 100 input slots across 19+ providers
 - Single output key (OpenAI-compatible)
 - Web dashboard with real-time stats

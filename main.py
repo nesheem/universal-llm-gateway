@@ -1,6 +1,12 @@
 """
-Universal LLM Gateway v1.0 — main.py
+Universal LLM Gateway v1.1 — main.py
 Entry point. ssl_patch MUST be the first import.
+
+Fixes applied:
+  - DNS pre-flight check at startup with clear actionable error messages.
+  - If all slots fail health check, a second check is attempted after a short
+    delay to handle transient startup network issues.
+  - Startup banner now shows DNS status.
 """
 import ssl_patch  # ← fixes Windows async SSL — must be first
 
@@ -34,6 +40,53 @@ logger = logging.getLogger("UniversalLLMGateway")
 CONFIG_PATH = Path("config.json")
 
 # =============================================================================
+# DNS PRE-FLIGHT
+# =============================================================================
+
+def _dns_preflight() -> dict:
+    """
+    Check DNS resolution for the most common API endpoints.
+    Returns a dict of { host: reachable(bool) }.
+    Prints a clear warning if any hosts are unreachable.
+    """
+    from ssl_patch import check_dns
+    results = check_dns([
+        "api.groq.com",
+        "generativelanguage.googleapis.com",
+        "api.openai.com",
+        "api.anthropic.com",
+        "api.mistral.ai",
+    ])
+    ok    = [h for h, up in results.items() if up]
+    failed = [h for h, up in results.items() if not up]
+
+    if failed:
+        print()
+        print("  ╔══════════════════════════════════════════════════════════╗")
+        print("  ║  ⚠  DNS WARNING — some API hosts are unreachable        ║")
+        print("  ╠══════════════════════════════════════════════════════════╣")
+        for h in failed:
+            print(f"  ║  ✗  {h:<52} ║")
+        print("  ╠══════════════════════════════════════════════════════════╣")
+        print("  ║  Possible causes:                                        ║")
+        print("  ║   • DNS server unreachable — check network adapter DNS   ║")
+        print("  ║     settings (try 8.8.8.8 or 1.1.1.1)                   ║")
+        print("  ║   • Firewall / corporate proxy blocking port 443         ║")
+        print("  ║     Set: HTTPS_PROXY=http://proxy:port before running    ║")
+        print("  ║   • VPN intercepting DNS — try routing API hosts through ║")
+        print("  ║     the VPN or use split-tunnelling                      ║")
+        print("  ║   • SSL/TLS interception — set ULG_DISABLE_SSL_VERIFY=1  ║")
+        print("  ║     as a LAST RESORT (insecure — only in trusted nets)   ║")
+        print("  ╚══════════════════════════════════════════════════════════╝")
+        print()
+        logger.warning(f"DNS pre-flight: {len(failed)} host(s) unreachable: {failed}")
+    else:
+        logger.info(f"DNS pre-flight: all {len(ok)} host(s) reachable ✅")
+
+    return results
+
+
+# =============================================================================
 # CONFIG
 # =============================================================================
 
@@ -57,8 +110,8 @@ def load_config() -> dict:
     static = _read_config_py()
     if not CONFIG_PATH.exists():
         cfg = {
-            "engine":         "Universal LLM Gateway v1.0",
-            "version":        "1.0",
+            "engine":         "Universal LLM Gateway v1.1",
+            "version":        "1.1",
             "proxy_port":     static.get("proxy_port", 8900),
             "dash_port":      static.get("dashboard_port", 8901),
             "output_key":     _make_output_key_entry(),
@@ -73,8 +126,8 @@ def load_config() -> dict:
         return cfg
 
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    cfg["version"]      = "1.0"
-    cfg["engine"]       = "Universal LLM Gateway v1.0"
+    cfg["version"]      = "1.1"
+    cfg["engine"]       = "Universal LLM Gateway v1.1"
     cfg["_config_path"] = str(CONFIG_PATH)
 
     # Migrate old key format
@@ -225,7 +278,7 @@ def build_proxy(cfg, output_key_mgr: OutputKeyManager, router):
     from fastapi import FastAPI, Request, HTTPException, Header
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    app = FastAPI(title="Universal LLM Gateway v1.0", version="1.0",
+    app = FastAPI(title="Universal LLM Gateway v1.1", version="1.1",
                   docs_url=None, redoc_url=None)
 
     def _key(auth: Optional[str]) -> Optional[str]:
@@ -238,11 +291,11 @@ def build_proxy(cfg, output_key_mgr: OutputKeyManager, router):
         slots   = router.sm.slots
         healthy = sum(1 for s in slots if s.is_healthy)
         return {
-            "name":    "Universal LLM Gateway v1.0",
+            "name":    "Universal LLM Gateway v1.1",
             "status":  "running",
             "slots":   f"{len(slots)}/100",
             "healthy": healthy,
-            "version": "1.0",
+            "version": "1.1",
         }
 
     @app.get("/v1/models")
@@ -356,15 +409,21 @@ async def main():
     okm    = OutputKeyManager(cfg)
 
     proxy_port = cfg.get("proxy_port", 8900)
-    dash_port  = cfg.get("dash_port", 8901)
+    dash_port  = cfg.get("dash_port",  8901)
+
+    # ── DNS pre-flight ────────────────────────────────────────────────────────
+    dns_results = _dns_preflight()
+    dns_ok  = sum(1 for v in dns_results.values() if v)
+    dns_all = len(dns_results)
 
     print()
     print("=" * 64)
-    print("   UNIVERSAL LLM GATEWAY v1.0")
+    print("   UNIVERSAL LLM GATEWAY v1.1")
     print("=" * 64)
     print(f"  Proxy API   : http://0.0.0.0:{proxy_port}/v1")
     print(f"  Dashboard   : http://0.0.0.0:{dash_port}")
     print(f"  Input Slots : {len(sm.slots)}/100")
+    print(f"  DNS Status  : {dns_ok}/{dns_all} hosts reachable")
     print(f"  Health Check: every 1h")
     print(f"  Benchmark   : daily at 00:00")
     print("=" * 64)
@@ -381,7 +440,19 @@ async def main():
 
     h = sum(1 for s in sm.slots if s.is_healthy)
     if h == 0:
-        logger.warning("No healthy slots after health check!")
+        logger.warning(
+            "No healthy slots after initial health check. "
+            "This is likely a network/DNS issue — see the DNS warning above. "
+            "Retrying health check in 15 seconds..."
+        )
+        await asyncio.sleep(15)
+        await hc.check_all()
+        h = sum(1 for s in sm.slots if s.is_healthy)
+        if h == 0:
+            logger.warning(
+                "Still no healthy slots. Gateway will start but requests will fail "
+                "until connectivity is restored. Use the dashboard to re-run health check."
+            )
     else:
         logger.info(f"{h}/{len(sm.slots)} healthy — benchmarking...")
         await bm.benchmark_all()
@@ -402,7 +473,7 @@ async def main():
                            log_level="warning", access_log=False)
         await uvicorn.Server(c).serve()
 
-    logger.info("Universal LLM Gateway v1.0 running!")
+    logger.info("Universal LLM Gateway v1.1 running!")
 
     await asyncio.gather(
         asyncio.create_task(_proxy()),
